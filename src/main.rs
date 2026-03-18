@@ -13,7 +13,7 @@ use log4rs;
 mod tcp;
 mod udp;
 mod dns;
-use serde::{Deserialize, Serialize};
+use rproxy::Proxy;
 
 #[allow(dead_code)]
 #[derive(FromArgs)]
@@ -41,12 +41,6 @@ struct Options {
     config: Option<PathBuf>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct Proxy {
-    remote: String,
-    bind: String,
-    protocol: String
-}
 
 static MY_LOGGER: MyLogger = MyLogger;
 
