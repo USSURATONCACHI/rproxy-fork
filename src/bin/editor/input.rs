@@ -15,6 +15,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         Mode::Command => handle_command(app, key),
         Mode::ConfirmDelete => handle_confirm_delete(app, key),
         Mode::Help => handle_help(app, key),
+        Mode::Settings => handle_settings(app, key),
     }
 }
 
@@ -35,6 +36,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('i') | KeyCode::Enter => app.enter_edit(),
         KeyCode::Char('a') => app.enter_insert(),
         KeyCode::Char('d') => app.request_delete(),
+        KeyCode::Char('s') => app.enter_settings(),
         KeyCode::Char(':') => app.enter_command(),
         KeyCode::Char('?') => {
             app.mode = Mode::Help;
@@ -113,6 +115,20 @@ fn handle_help(app: &mut App, key: KeyEvent) {
             app.mode = Mode::Normal;
             app.message = None;
         }
+        _ => {}
+    }
+}
+
+fn handle_settings(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_settings(),
+        KeyCode::Enter => app.confirm_settings(),
+        KeyCode::Tab => app.settings_next_field(),
+        KeyCode::BackTab => app.settings_prev_field(),
+        KeyCode::Backspace => app.settings_delete_char(),
+        KeyCode::Left => app.settings_cursor_left(),
+        KeyCode::Right => app.settings_cursor_right(),
+        KeyCode::Char(c) => app.settings_insert_char(c),
         _ => {}
     }
 }

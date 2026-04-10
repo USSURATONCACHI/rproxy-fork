@@ -19,9 +19,10 @@ use futures::{
     }
 };
 
-use crate::dns::DNSResolve;
+use tokio_util::sync::CancellationToken;
 
-const MAX_CLIENT_TUNNELS: usize = 1024;
+use crate::dns::DNSResolve;
+use rproxy::Settings;
 
 #[allow(dead_code)]
 enum MessageType{
@@ -135,8 +136,9 @@ struct UDPProxy<'a> {
     addr: &'a String,
     remote: &'a String,
     dns: Vec<String>,
-    client_tunnels: HashMap<SocketAddr, (Tx, SystemTime)>
-
+    client_tunnels: HashMap<SocketAddr, (Tx, SystemTime)>,
+    settings: Arc<Settings>,
+    cancel: CancellationToken,
 }
 
 impl<'a> DNSResolve<'a> for UDPProxy<'a>{
@@ -173,6 +175,7 @@ impl<'a> UDPProxy<'a> {
         // let (mut socket_recv, mut socket_send) = socket.split();
         let socket_recv = socket.clone();
         let socket_send = socket.clone();
+        let cancel_token = self.cancel.clone();
         let (tx, mut rx) = unbounded::<(SocketAddr, Vec<u8>,  MessageType)>();
         let remote_to_client_proc = async move {
             loop{
@@ -219,8 +222,9 @@ impl<'a> UDPProxy<'a> {
                                         self.client_tunnels.remove(&peer);
                                     }
 
-                                    if self.client_tunnels.len() >= MAX_CLIENT_TUNNELS {
-                                        warn!("Client tunnel limit reached ({}), rejecting {}:{}", MAX_CLIENT_TUNNELS, peer.ip(), peer.port());
+                                    let max_tunnels = self.settings.max_client_tunnels;
+                                    if self.client_tunnels.len() >= max_tunnels {
+                                        warn!("Client tunnel limit reached ({}), rejecting {}:{}", max_tunnels, peer.ip(), peer.port());
                                         continue;
                                     }
 
@@ -273,6 +277,15 @@ impl<'a> UDPProxy<'a> {
                             self.client_tunnels.remove(&k);
                         }
 
+                    },
+                    _ = cancel_token.cancelled() => {
+                        info!("UDP proxy {} shutting down (existing tunnels will drain)", self.addr);
+                        // Send terminate to all active tunnels
+                        for (k, (tx, _)) in self.client_tunnels.iter() {
+                            let _ = tx.unbounded_send((k.clone(), empty.clone(), MessageType::Terminate));
+                        }
+                        self.client_tunnels.clear();
+                        break;
                     }
                 }
             }
@@ -285,14 +298,17 @@ impl<'a> UDPProxy<'a> {
 }
 
 pub async fn udp_proxy(local: &String,
-    remote:&String) -> Result<(), std::io::Error>
+    remote: &String, settings: Arc<Settings>, cancel: CancellationToken) -> Result<(), std::io::Error>
 {
+    info!("Start service in UDP mode {}->{} (max_client_tunnels={})",
+        local, remote, settings.max_client_tunnels);
     let mut server = UDPProxy {
         addr: &local,
         remote: &remote,
         dns: vec![],
-        client_tunnels: HashMap::new()
+        client_tunnels: HashMap::new(),
+        settings,
+        cancel,
     };
-    info!("Start service in UDP mode {}->{}", server.addr, server.remote);
     return server.run().await;
 }

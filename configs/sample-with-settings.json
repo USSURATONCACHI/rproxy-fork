@@ -1,0 +1,15 @@
+{
+    "settings": {
+        "max_connections": 2048,
+        "max_client_tunnels": 1024,
+        "keepalive_idle": 120,
+        "keepalive_interval": 30
+    },
+    "proxies": [
+        {
+            "bind": "127.0.0.1:17778",
+            "remote": "10.99.100.9:8000",
+            "protocol": "TCP"
+        }
+    ]
+}

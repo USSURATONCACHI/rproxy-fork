@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{App, EditField, Mode};
+use super::app::{App, EditField, Mode, SettingsField};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -25,6 +25,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Overlays
     match app.mode {
         Mode::Edit | Mode::Insert => render_edit_popup(frame, app),
+        Mode::Settings => render_settings_popup(frame, app),
         Mode::Help => render_help_popup(frame),
         _ => {}
     }
@@ -108,7 +109,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             if let Some(msg) = &app.message {
                 msg.clone()
             } else {
-                " [NORMAL] j/k:nav  i:edit  a:add  d:del  ::cmd  ?:help  q:quit".into()
+                " [NORMAL] j/k:nav  i:edit  a:add  d:del  s:settings  ::cmd  ?:help  q:quit".into()
             }
         }
         Mode::Edit => " [EDIT] Tab:next field  Enter:confirm  Esc:cancel".into(),
@@ -118,12 +119,14 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             .message
             .clone()
             .unwrap_or_else(|| " Delete? y/n".into()),
+        Mode::Settings => " [SETTINGS] Tab:next field  Enter:confirm  Esc:cancel".into(),
         Mode::Help => " [HELP] Press Esc or q to close".into(),
     };
 
     let style = match app.mode {
         Mode::Normal => Style::default().bg(Color::DarkGray).fg(Color::White),
         Mode::Edit | Mode::Insert => Style::default().bg(Color::Green).fg(Color::Black),
+        Mode::Settings => Style::default().bg(Color::Cyan).fg(Color::Black),
         Mode::Command => Style::default().bg(Color::DarkGray).fg(Color::White),
         Mode::ConfirmDelete => Style::default().bg(Color::Red).fg(Color::White),
         Mode::Help => Style::default().bg(Color::Magenta).fg(Color::White),
@@ -251,6 +254,83 @@ fn render_protocol_field(frame: &mut Frame, value: &str, active: bool, area: Rec
     frame.render_widget(value_widget, line[1]);
 }
 
+fn render_settings_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(60, 50, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title("Settings")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let field_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // MaxConnections
+            Constraint::Length(2), // MaxClientTunnels
+            Constraint::Length(2), // KeepaliveIdle
+            Constraint::Length(2), // KeepaliveInterval
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // help
+        ])
+        .split(inner);
+
+    let fields = [
+        (SettingsField::MaxConnections, app.settings.max_connections.to_string()),
+        (SettingsField::MaxClientTunnels, app.settings.max_client_tunnels.to_string()),
+        (SettingsField::KeepaliveIdle, app.settings.keepalive_idle.to_string()),
+        (SettingsField::KeepaliveInterval, app.settings.keepalive_interval.to_string()),
+    ];
+
+    for (idx, (field, default_val)) in fields.iter().enumerate() {
+        let active = app.settings_field == *field;
+        let display_val = if active {
+            let mut v = app.settings_buffer.clone();
+            if app.settings_cursor >= v.len() {
+                v.push('_');
+            }
+            v
+        } else {
+            default_val.clone()
+        };
+
+        let label_style = if active {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let input_style = if active {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default()
+        };
+
+        let row = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(24), Constraint::Min(1)])
+            .split(field_chunks[idx]);
+
+        let label = Paragraph::new(format!(" {}:", field.label())).style(label_style);
+        frame.render_widget(label, row[0]);
+
+        let value = Paragraph::new(format!(" {}", display_val)).style(input_style);
+        frame.render_widget(value, row[1]);
+    }
+
+    let help = Paragraph::new(Line::from(vec![
+        Span::styled(" Enter", Style::default().fg(Color::Yellow)),
+        Span::raw(": confirm  "),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::raw(": cancel  "),
+        Span::styled("Tab", Style::default().fg(Color::Yellow)),
+        Span::raw(": next field"),
+    ]));
+    frame.render_widget(help, field_chunks[5]);
+}
+
 fn render_help_popup(frame: &mut Frame) {
     let area = centered_rect(65, 70, frame.area());
     frame.render_widget(Clear, area);
@@ -272,6 +352,7 @@ fn render_help_popup(frame: &mut Frame) {
         Line::from("    i / Enter     Edit selected entry"),
         Line::from("    a             Add new entry"),
         Line::from("    d             Delete selected entry"),
+        Line::from("    s             Edit settings"),
         Line::from("    :             Enter command mode"),
         Line::from("    ?             Show this help"),
         Line::from("    q             Quit"),
