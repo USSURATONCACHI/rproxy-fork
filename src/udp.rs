@@ -1,4 +1,4 @@
-﻿
+
 use std::sync::Arc;
 use futures::future::try_join;
 use std::collections::HashMap;
@@ -20,6 +20,8 @@ use futures::{
 };
 
 use crate::dns::DNSResolve;
+
+const MAX_CLIENT_TUNNELS: usize = 1024;
 
 #[allow(dead_code)]
 enum MessageType{
@@ -59,7 +61,7 @@ impl UDPPeerPair {
                     match msg_type {
                         MessageType::Terminate => {
                             debug!("{}:{} sends TERMINATE signal", client_peer.ip(), client_peer.port());
-                            ctrl_tx.unbounded_send(MessageType::Terminate).unwrap();
+                            let _ = ctrl_tx.unbounded_send(MessageType::Terminate);
                             break;
                         },
                         _ => {}
@@ -70,11 +72,16 @@ impl UDPPeerPair {
                         Ok(_sz) => {
 
                         },
-                        Err(_e) => {
-                            panic!("{}", _e);
+                        Err(e) => {
+                            warn!("{}:{} send_to failed: {:?}", client_peer.ip(), client_peer.port(), e);
+                            let _ = ctrl_tx.unbounded_send(MessageType::Terminate);
+                            break;
                         }
                     }
                 } else {
+                    // Channel closed — sender was dropped (client timed out or cleaned up)
+                    debug!("{}:{} channel closed", client_peer.ip(), client_peer.port());
+                    let _ = ctrl_tx.unbounded_send(MessageType::Terminate);
                     break;
                 }
             }
@@ -89,7 +96,7 @@ impl UDPPeerPair {
                             // debug!("Recv {} bytes to {}", _size, client_peer);
                             match _tx.unbounded_send((client_peer, Vec::from(&buf[.._size]), MessageType::Data)) {
                                 Ok(_sz) => {
-        
+
                                 },
                                 Err(_e) => {
                                     return Err(std::io::Error::from(Other));
@@ -108,15 +115,19 @@ impl UDPPeerPair {
 
                                 }
                             }
+                        } else {
+                            // ctrl channel closed — other side exited
+                            debug!("{}:{} ctrl channel closed", client_peer.ip(), client_peer.port());
+                            break;
                         }
                     }
-                }                
+                }
             }
             Ok(())
         };
-        try_join(client_to_remote_proc, remote_to_client_proc).await.unwrap();
+        let _ = try_join(client_to_remote_proc, remote_to_client_proc).await;
         debug!("{}:{} exits", client_peer.ip(), client_peer.port());
-        Ok(())        
+        Ok(())
     }
 
 }
@@ -195,29 +206,44 @@ impl<'a> UDPProxy<'a> {
                     data = socket_recv.recv_from(&mut buf) => {
                         match data {
                             Ok((size, peer)) => {
-                                // let _addr = format!("{}:{}", peer.ip(), peer.port());
-                                match self.client_tunnels.get(&peer) {
-                                    Some((_tx, _active_time)) => {
-                                        // _tx.unbounded_send((peer, Vec::from(&buf[..size]), MessageType::Data)).unwrap();
-                                    },
-                                    _ => {
-                                        info!("New client {}:{} is added", peer.ip(), peer.port());
-                                        let (mut _s,_r) = unbounded::<(SocketAddr, Vec<u8>,  MessageType)>();
-                                        // _s.unbounded_send((peer, buf.clone(), MessageType::Data)).unwrap();
-                                        self.client_tunnels.insert(peer, (_s, SystemTime::now()));
-                                        let c = UDPPeerPair {
-                                            client : peer,
-                                            remote: _remote.parse::<SocketAddr>().unwrap(),
-                                            send: tx.clone(),
-                                            recv: _r
-                                        };
-                                        tokio::spawn(c.run());
+                                // Check if tunnel still has a working channel
+                                let needs_new_tunnel = match self.client_tunnels.get(&peer) {
+                                    Some((tx, _)) => tx.is_closed(),
+                                    None => true,
+                                };
+
+                                if needs_new_tunnel {
+                                    // Remove stale entry if it exists
+                                    if self.client_tunnels.contains_key(&peer) {
+                                        info!("Replacing stale tunnel for {}:{}", peer.ip(), peer.port());
+                                        self.client_tunnels.remove(&peer);
+                                    }
+
+                                    if self.client_tunnels.len() >= MAX_CLIENT_TUNNELS {
+                                        warn!("Client tunnel limit reached ({}), rejecting {}:{}", MAX_CLIENT_TUNNELS, peer.ip(), peer.port());
+                                        continue;
+                                    }
+
+                                    info!("New client {}:{} is added", peer.ip(), peer.port());
+                                    let (_s, _r) = unbounded::<(SocketAddr, Vec<u8>,  MessageType)>();
+                                    self.client_tunnels.insert(peer, (_s, SystemTime::now()));
+                                    let c = UDPPeerPair {
+                                        client : peer,
+                                        remote: _remote.parse::<SocketAddr>().unwrap(),
+                                        send: tx.clone(),
+                                        recv: _r
+                                    };
+                                    tokio::spawn(c.run());
+                                }
+
+                                if let Some((tx, tm)) = self.client_tunnels.get_mut(&peer) {
+                                    if let Err(_) = tx.unbounded_send((peer, Vec::from(&buf[..size]), MessageType::Data)) {
+                                        warn!("Failed to send data to tunnel for {}:{}, removing", peer.ip(), peer.port());
+                                        self.client_tunnels.remove(&peer);
+                                    } else {
+                                        *tm = SystemTime::now();
                                     }
                                 }
-                                let (tx, tm) = &mut self.client_tunnels.get_mut(&peer).unwrap();
-                                // debug!("Recv {} bytes from {}", size, peer);
-                                tx.unbounded_send((peer, Vec::from(&buf[..size]), MessageType::Data)).unwrap();
-                                *tm = SystemTime::now();
                             },
                             Err(e) => {
                                 warn!("recv_from {:?} returned error {}, {:?}", socket_recv, e, e);
@@ -236,7 +262,7 @@ impl<'a> UDPProxy<'a> {
                             let sec = v.1.elapsed().unwrap().as_secs();
                             if sec > 120{
                                 info!("Client {}:{} is timeout({}s)", k.ip(), k.port(), sec);
-                                v.0.unbounded_send((k.clone(), empty.clone(), MessageType::Terminate)).unwrap();
+                                let _ = v.0.unbounded_send((k.clone(), empty.clone(), MessageType::Terminate));
                                 tbd.push(k.to_owned());
                             } else {
                                 debug!("Client {}:{} is good. ({}s)", k.ip(), k.port(), sec);
@@ -258,7 +284,7 @@ impl<'a> UDPProxy<'a> {
     }
 }
 
-pub async fn udp_proxy(local: &String, 
+pub async fn udp_proxy(local: &String,
     remote:&String) -> Result<(), std::io::Error>
 {
     let mut server = UDPProxy {
