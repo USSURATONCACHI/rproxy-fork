@@ -2,7 +2,7 @@
 
 A blazing fast, cross-platform, transparent **TCP & UDP proxy** written in Rust. No bloat, no config headaches — just simple port forwarding that works out of the box.
 
-Now ships with **rproxy-edit**, a built-in terminal UI for managing your proxy configurations visually instead of hand-editing JSON.
+Ships with **rproxy-edit**, a built-in terminal UI for managing proxy configurations visually, and **hot reload** support — update your config and apply changes without dropping a single connection.
 
 ## Installation
 
@@ -39,19 +39,29 @@ rproxy -c proxies.json
 Where `proxies.json` looks like:
 
 ```json
-[
-    {
-        "bind": "0.0.0.0:8080",
-        "remote": "10.0.0.5:3000",
-        "protocol": "TCP"
+{
+    "settings": {
+        "max_connections": 2048,
+        "max_client_tunnels": 1024,
+        "keepalive_idle": 60,
+        "keepalive_interval": 30
     },
-    {
-        "bind": "0.0.0.0:1194",
-        "remote": "vpn-server.example.com:1194",
-        "protocol": "UDP"
-    }
-]
+    "proxies": [
+        {
+            "bind": "0.0.0.0:8080",
+            "remote": "10.0.0.5:3000",
+            "protocol": "TCP"
+        },
+        {
+            "bind": "0.0.0.0:1194",
+            "remote": "vpn-server.example.com:1194",
+            "protocol": "UDP"
+        }
+    ]
+}
 ```
+
+The `settings` block is optional — omit it to use defaults. Plain JSON arrays (the old format) are still supported for backward compatibility.
 
 ### Edit Configs with the TUI
 
@@ -70,7 +80,7 @@ rproxy-edit proxies.json
 │> 1 │ 0.0.0.0:8080     │ 10.0.0.5:3000    │  TCP  │
 │  2 │ 0.0.0.0:1194     │ vpn-server.ex... │  UDP  │
 ├────┴──────────────────┴──────────────────┴───────┤
-│ [NORMAL] j/k:nav  i:edit  a:add  d:del  ?:help  │
+│ [NORMAL] j/k:nav  i:edit  a:add  d:del  s:settings│
 └─────────────────────────────────────────────────┘
 ```
 
@@ -82,6 +92,7 @@ Keybindings (Helix/Vim-style):
 | `i` / `Enter` | Edit selected entry |
 | `a` | Add new proxy entry |
 | `d` | Delete selected entry |
+| `s` | Edit settings (connections, keepalive, etc.) |
 | `Tab` / `Shift+Tab` | Cycle fields in edit mode |
 | `Space` | Toggle protocol (TCP/UDP) |
 | `:w` | Save |
@@ -99,9 +110,17 @@ Options:
   -b, --bind <ip>:<port>        Local address to listen on
   -p, --protocol TCP|UDP        Protocol (UDP by default)
   -c, --config <file.json>      JSON config for multiple proxies
+  -s, --signal <reload>         Send signal to running rproxy (reload config)
   -d, --debug                   Enable debug logging
   -l, --logger_settings <file>  Logger config file (YAML)
+
+  --max-connections N           Max concurrent TCP connections (default: 1024)
+  --max-client-tunnels N        Max concurrent UDP client tunnels (default: 1024)
+  --keepalive-idle N            TCP keepalive idle time in seconds (default: 60)
+  --keepalive-interval N        TCP keepalive probe interval in seconds (default: 30)
 ```
+
+CLI flags override values from the config file's `settings` block.
 
 ## Use Cases
 
@@ -158,25 +177,77 @@ rproxy -b 0.0.0.0:27015 -r game-server.region.example.com:27015 -p UDP
 
 ### Managing Configs Across Environments
 
-Use `rproxy-edit` to maintain separate configs for different environments:
+Use `rproxy-edit` to maintain separate configs for different environments, then hot-reload without downtime:
 
 ```bash
-rproxy-edit configs/production.json   # edit production proxies
-rproxy-edit configs/staging.json      # edit staging proxies
-rproxy -c configs/production.json     # run production
+rproxy -c configs/production.json     # start production proxies
+rproxy-edit configs/production.json   # edit config in TUI (press 's' for settings)
+rproxy -s reload                      # apply changes — zero downtime
 ```
 
 The editor validates addresses and protocols before saving, so you catch mistakes before they hit production.
 
+## Hot Reload
+
+rproxy supports nginx-style hot reload — update your config file and apply changes without restarting the process or dropping existing connections.
+
+### How It Works
+
+1. Start rproxy with a config file:
+
+```bash
+rproxy -c proxies.json
+```
+
+2. Edit the config (add, remove, or change proxies) using `rproxy-edit` or any text editor:
+
+```bash
+rproxy-edit proxies.json
+```
+
+3. Apply changes without restarting:
+
+```bash
+rproxy -s reload
+```
+
+rproxy compares the old and new config and makes the minimum necessary changes:
+
+| Change | What happens |
+|--------|-------------|
+| **Proxy unchanged** (same bind, remote, protocol) | No interruption — zero downtime |
+| **New proxy added** | Started immediately |
+| **Proxy removed** | Stops accepting new connections, existing connections drain gracefully |
+| **Proxy changed** (same bind, different remote) | Old proxy drains, new proxy starts |
+
+Existing TCP connections through unchanged proxies are **never dropped**. UDP tunnels through removed proxies receive a clean terminate signal and drain naturally.
+
+### Under the Hood
+
+When started with `-c`, rproxy writes its PID to `/tmp/rproxy.pid`. Running `rproxy -s reload` reads the PID file and sends `SIGHUP` to the process, which triggers the config diff and reload cycle.
+
 ## Configuration Format
 
-Each config file is a JSON array of proxy entries:
+Config files use a JSON object with an optional `settings` block and a `proxies` array. Plain JSON arrays (without the wrapper object) are also supported for backward compatibility.
+
+### Proxy Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `bind` | `string` | Local `ip:port` to listen on |
 | `remote` | `string` | Remote `host:port` to forward to (supports hostnames with auto DNS refresh) |
 | `protocol` | `string` | `"TCP"` or `"UDP"` |
+
+### Settings Fields
+
+All settings are optional and have sensible defaults:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_connections` | `integer` | `1024` | Max concurrent TCP connections |
+| `max_client_tunnels` | `integer` | `1024` | Max concurrent UDP client tunnels |
+| `keepalive_idle` | `integer` | `60` | Seconds of idle before first TCP keepalive probe |
+| `keepalive_interval` | `integer` | `30` | Seconds between TCP keepalive probes |
 
 rproxy automatically re-resolves DNS hostnames every 30 seconds, so you can point at dynamic endpoints without restarts.
 

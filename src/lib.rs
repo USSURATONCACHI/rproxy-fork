@@ -53,22 +53,22 @@ pub fn load_config(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
         Ok(config)
     } else {
         let proxies: Vec<Proxy> = serde_json::from_str(content)?;
-        Ok(Config {
+        let config = Config {
             settings: Settings::default(),
             proxies,
-        })
+        };
+
+        // Auto-convert old format to new format
+        if let Ok(json) = serde_json::to_string_pretty(&config) {
+            let _ = std::fs::write(path, json);
+        }
+
+        Ok(config)
     }
 }
 
 pub fn save_config(path: &Path, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string_pretty(config)?;
-    std::fs::write(path, json)?;
-    Ok(())
-}
-
-/// Save only the proxies list (for rproxy-edit backward compat)
-pub fn save_proxies(path: &Path, proxies: &[Proxy]) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_string_pretty(proxies)?;
     std::fs::write(path, json)?;
     Ok(())
 }
