@@ -16,7 +16,13 @@ mod udp;
 mod dns;
 use rproxy::{Proxy, Settings};
 
-const PID_FILE: &str = "/tmp/rproxy.pid";
+fn pid_file_path() -> PathBuf {
+    std::env::temp_dir().join("rproxy.pid")
+}
+
+fn reload_signal_path() -> PathBuf {
+    std::env::temp_dir().join("rproxy.reload")
+}
 
 #[allow(dead_code)]
 #[derive(FromArgs)]
@@ -91,43 +97,68 @@ fn build_settings(options: &Options, base: Settings) -> Settings {
 }
 
 fn write_pid_file() {
+    let path = pid_file_path();
     let pid = std::process::id();
-    if let Err(e) = std::fs::write(PID_FILE, pid.to_string()) {
-        warn!("Failed to write PID file {}: {}", PID_FILE, e);
+    if let Err(e) = std::fs::write(&path, pid.to_string()) {
+        warn!("Failed to write PID file {}: {}", path.display(), e);
     } else {
-        info!("PID {} written to {}", pid, PID_FILE);
+        info!("PID {} written to {}", pid, path.display());
     }
 }
 
 fn remove_pid_file() {
-    let _ = std::fs::remove_file(PID_FILE);
+    let _ = std::fs::remove_file(pid_file_path());
+    let _ = std::fs::remove_file(reload_signal_path());
 }
 
 fn send_reload_signal() {
-    match std::fs::read_to_string(PID_FILE) {
+    let pid_path = pid_file_path();
+
+    // Verify rproxy is running by checking PID file
+    match std::fs::read_to_string(&pid_path) {
         Ok(content) => {
-            match content.trim().parse::<i32>() {
+            match content.trim().parse::<u32>() {
                 Ok(pid) => {
-                    use nix::sys::signal::{kill, Signal};
-                    use nix::unistd::Pid;
-                    match kill(Pid::from_raw(pid), Signal::SIGHUP) {
-                        Ok(()) => {
-                            println!("Reload signal sent to rproxy (PID {})", pid);
+                    // On Unix, send SIGHUP directly
+                    #[cfg(unix)]
+                    {
+                        use nix::sys::signal::{kill, Signal};
+                        use nix::unistd::Pid;
+                        match kill(Pid::from_raw(pid as i32), Signal::SIGHUP) {
+                            Ok(()) => {
+                                println!("Reload signal sent to rproxy (PID {})", pid);
+                                return;
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to send signal to PID {}: {}", pid, e);
+                                std::process::exit(1);
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("Failed to send signal to PID {}: {}", pid, e);
-                            std::process::exit(1);
+                    }
+
+                    // On Windows (or fallback), write a signal file that the running process polls
+                    #[cfg(not(unix))]
+                    {
+                        let signal_path = reload_signal_path();
+                        match std::fs::write(&signal_path, "reload") {
+                            Ok(()) => {
+                                println!("Reload signal written for rproxy (PID {})", pid);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to write reload signal file: {}", e);
+                                std::process::exit(1);
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Invalid PID in {}: {}", PID_FILE, e);
+                    eprintln!("Invalid PID in {}: {}", pid_path.display(), e);
                     std::process::exit(1);
                 }
             }
         }
         Err(e) => {
-            eprintln!("Failed to read PID file {}: {}. Is rproxy running?", PID_FILE, e);
+            eprintln!("Failed to read PID file {}: {}. Is rproxy running?", pid_path.display(), e);
             std::process::exit(1);
         }
     }
@@ -191,14 +222,13 @@ fn reload_config(
                 info!("[reload] Stopping proxy on {}", key);
                 if let Some(task) = running.remove(key) {
                     task.cancel.cancel();
-                    // task.handle will complete on its own
                 }
             }
             Some(new_proxy) => {
                 let old_task = running.get(key).unwrap();
                 if old_task.proxy.remote != new_proxy.remote || old_task.proxy.protocol != new_proxy.protocol {
                     // Changed — cancel old, will spawn new below
-                    info!("[reload] Restarting proxy on {} ({}→{})",
+                    info!("[reload] Restarting proxy on {} ({}->{})",
                         key, old_task.proxy.remote, new_proxy.remote);
                     if let Some(task) = running.remove(key) {
                         task.cancel.cancel();
@@ -221,6 +251,29 @@ fn reload_config(
     }
 
     info!("[reload] Configuration reloaded: {} proxies active", running.len());
+}
+
+/// Wait for a reload signal. On Unix uses SIGHUP, on Windows polls a signal file.
+async fn wait_for_reload_signal() {
+    #[cfg(unix)]
+    {
+        let mut sighup = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::hangup()
+        ).expect("Failed to register SIGHUP handler");
+        sighup.recv().await;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let signal_path = reload_signal_path();
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            if signal_path.exists() {
+                let _ = std::fs::remove_file(&signal_path);
+                break;
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -296,17 +349,12 @@ async fn main(){
                 running.insert(proxy.bind.clone(), task);
             }
 
-            info!("Started {} proxies, listening for SIGHUP to reload config", running.len());
-
-            // Listen for SIGHUP
-            let mut sighup = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::hangup()
-            ).expect("Failed to register SIGHUP handler");
+            info!("Started {} proxies, listening for reload signal", running.len());
 
             loop {
                 tokio::select! {
-                    _ = sighup.recv() => {
-                        info!("[reload] SIGHUP received, reloading configuration from {}", config_path.display());
+                    _ = wait_for_reload_signal() => {
+                        info!("[reload] Reload signal received, reloading configuration from {}", config_path.display());
                         reload_config(config_path.as_path(), &options, &mut running);
                     },
                     _ = tokio::signal::ctrl_c() => {
