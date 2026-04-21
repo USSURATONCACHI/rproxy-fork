@@ -14,6 +14,10 @@ use crate::dns::DNSResolve;
 use rproxy::Settings;
 
 fn set_keepalive(stream: &TcpStream, settings: &Settings) {
+    // keepalive_idle == 0 means disabled — leave OS defaults alone
+    if settings.keepalive_idle == 0 {
+        return;
+    }
     let sock = socket2::SockRef::from(stream);
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(settings.keepalive_idle))

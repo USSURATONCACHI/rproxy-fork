@@ -10,8 +10,11 @@ pub struct Proxy {
 
 fn default_max_connections() -> usize { 1024 }
 fn default_max_client_tunnels() -> usize { 1024 }
-fn default_keepalive_idle() -> u64 { 60 }
-fn default_keepalive_interval() -> u64 { 30 }
+// Match Linux OS default (7200s / 2 hours). Shorter values can abort long HTTP
+// requests during server-side processing when no bytes flow through the proxy.
+// Set to 0 to disable keepalive entirely.
+fn default_keepalive_idle() -> u64 { 7200 }
+fn default_keepalive_interval() -> u64 { 75 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
