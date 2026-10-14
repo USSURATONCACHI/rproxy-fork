@@ -1,23 +1,14 @@
-
-use std::sync::Arc;
+use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::future::try_join;
+use futures::StreamExt;
+use log::*;
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::time::SystemTime;
 use std::io::ErrorKind::Other;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::net::UdpSocket;
 use tokio::time;
-use log::*;
-use futures::StreamExt;
-use futures::{
-    channel::{
-        mpsc::{
-            UnboundedReceiver,
-            UnboundedSender,
-            unbounded
-        }
-    }
-};
 
 use tokio_util::sync::CancellationToken;
 
@@ -25,26 +16,34 @@ use crate::dns::DNSResolve;
 use rproxy::Settings;
 
 #[allow(dead_code)]
-enum MessageType{
+enum MessageType {
     Data,
     Terminate,
-    DNS
+    DNS,
 }
 
-type Tx=UnboundedSender<(SocketAddr, Vec<u8>, MessageType)>;
-type Rx=UnboundedReceiver<(SocketAddr, Vec<u8>, MessageType)>;
+type Tx = UnboundedSender<(SocketAddr, Vec<u8>, MessageType)>;
+type Rx = UnboundedReceiver<(SocketAddr, Vec<u8>, MessageType)>;
 
 struct UDPPeerPair {
     client: SocketAddr,
     remote: SocketAddr,
     send: Tx,
-    recv: Rx
+    recv: Rx,
 }
 
 impl UDPPeerPair {
-
-    async fn run(mut self) -> Result<(), std::io::Error>{
-        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+    async fn run(mut self) -> Result<(), std::io::Error> {
+        // The relay socket must match the address family of the remote,
+        // otherwise send_to() fails with EAFNOSUPPORT ("Address family not
+        // supported by protocol") — e.g. an IPv4 socket cannot send to an
+        // IPv6 destination.
+        let bind_addr = if self.remote.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
         // let (mut socket_recv, mut socket_send) = socket.split();
         let socket_recv = socket.clone();
         let socket_send = socket.clone();
@@ -55,26 +54,31 @@ impl UDPPeerPair {
 
         let client_to_remote_proc = async move {
             // let mut buf: Vec<u8> = vec![0;1024*10];
-            loop{
-
+            loop {
                 if let Some((_peer, buf, msg_type)) = self.recv.next().await {
-
                     match msg_type {
                         MessageType::Terminate => {
-                            debug!("{}:{} sends TERMINATE signal", client_peer.ip(), client_peer.port());
+                            debug!(
+                                "{}:{} sends TERMINATE signal",
+                                client_peer.ip(),
+                                client_peer.port()
+                            );
                             let _ = ctrl_tx.unbounded_send(MessageType::Terminate);
                             break;
-                        },
+                        }
                         _ => {}
                     }
                     // debug!("Forward {} bytes from {}", buf.len(), _peer);
 
                     match socket_send.send_to(&buf[..], &remote_addr).await {
-                        Ok(_sz) => {
-
-                        },
+                        Ok(_sz) => {}
                         Err(e) => {
-                            warn!("{}:{} send_to failed: {:?}", client_peer.ip(), client_peer.port(), e);
+                            warn!(
+                                "{}:{} send_to failed: {:?}",
+                                client_peer.ip(),
+                                client_peer.port(),
+                                e
+                            );
                             let _ = ctrl_tx.unbounded_send(MessageType::Terminate);
                             break;
                         }
@@ -89,8 +93,8 @@ impl UDPPeerPair {
             Ok(())
         };
         let remote_to_client_proc = async move {
-            let mut buf: Vec<u8> = vec![0;1024*10];
-            loop{
+            let mut buf: Vec<u8> = vec![0; 1024 * 10];
+            loop {
                 tokio::select! {
                     x = socket_recv.recv_from(&mut buf) => {
                         if let Ok((_size, _peer)) = x {
@@ -130,7 +134,6 @@ impl UDPPeerPair {
         debug!("{}:{} exits", client_peer.ip(), client_peer.port());
         Ok(())
     }
-
 }
 struct UDPProxy<'a> {
     addr: &'a String,
@@ -141,50 +144,59 @@ struct UDPProxy<'a> {
     cancel: CancellationToken,
 }
 
-impl<'a> DNSResolve<'a> for UDPProxy<'a>{
-    fn remote(&self) ->  &String {
+impl<'a> DNSResolve<'a> for UDPProxy<'a> {
+    fn remote(&self) -> &String {
         &self.remote
     }
 
-    fn dns(&self) ->  &Vec<String>  {
+    fn dns(&self) -> &Vec<String> {
         &self.dns
     }
 
-    fn reset_dns(&mut self,d: &Vec<String>) -> usize {
+    fn reset_dns(&mut self, d: &Vec<String>) -> usize {
         self.dns = d.clone();
         d.len()
     }
-
 }
 
-
 impl<'a> UDPProxy<'a> {
-
     async fn run(&mut self) -> Result<(), std::io::Error> {
-        let socket = Arc::new(UdpSocket::bind(&self.addr).await.unwrap());
-        info!("Listening on {}", socket.local_addr().unwrap());
-        // let server: Vec<_> = self.remote
-        //                     .to_socket_addrs()
-        //                     .expect("Unable to resolve domain")
-        //                     .collect();
+        // Pre-flight: the remote must resolve to a usable IP:port before we
+        // start serving. UDP forwarding needs a concrete SocketAddr, so a
+        // hostname that doesn't resolve (or a bad literal) is a fatal startup
+        // error rather than an endless retry loop.
+        self.resolve().await?;
+        let initial_remote = self.dns.first().cloned().unwrap_or_default();
+        if initial_remote.parse::<SocketAddr>().is_err() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "remote '{}' could not be resolved to a usable IP:port address",
+                    self.remote
+                ),
+            ));
+        }
 
-        // let _remote = server[0];
-        self.resolve().await.unwrap();
+        // Refuse to start if the local address can't be bound (port in use,
+        // permission denied, ...) instead of panicking.
+        let socket = Arc::new(UdpSocket::bind(&self.addr).await.map_err(|e| {
+            std::io::Error::new(e.kind(), format!("cannot bind {}: {}", self.addr, e))
+        })?);
+        info!("Listening on {}", socket.local_addr()?);
+
         let mut dns_timeout = time::interval(tokio::time::Duration::from_secs(30));
-        let mut _remote = self.dns[0].clone();
+        let mut _remote = initial_remote;
         // let (mut socket_recv, mut socket_send) = socket.split();
         let socket_recv = socket.clone();
         let socket_send = socket.clone();
         let cancel_token = self.cancel.clone();
-        let (tx, mut rx) = unbounded::<(SocketAddr, Vec<u8>,  MessageType)>();
+        let (tx, mut rx) = unbounded::<(SocketAddr, Vec<u8>, MessageType)>();
         let remote_to_client_proc = async move {
-            loop{
+            loop {
                 if let Some((peer, buf, _msg_type)) = rx.next().await {
                     // debug!("Forward {} bytes to {}", buf.len(), peer);
                     match socket_send.send_to(&buf[..], &peer).await {
-                        Ok(_sz) => {
-
-                        },
+                        Ok(_sz) => {}
                         Err(e) => {
                             return Err(e);
                         }
@@ -194,17 +206,15 @@ impl<'a> UDPProxy<'a> {
                 }
             }
             Ok(())
-
         };
         // let mut client_run_procs: Vec<JoinHandle<Result<(), io::Error>> > = Vec::new();
 
         let client_to_proxy_proc = async move {
-            let mut buf: Vec<u8> = vec![0;1024*256];
-            let empty: Vec<u8> = vec![0;0];
+            let mut buf: Vec<u8> = vec![0; 1024 * 256];
+            let empty: Vec<u8> = vec![0; 0];
             // let mut client_tunnels:HashMap<SocketAddr, (Tx, SystemTime)> = HashMap::new();
             let mut time_out1 = time::interval(tokio::time::Duration::from_secs(5));
-            loop{
-
+            loop {
                 tokio::select! {
                     data = socket_recv.recv_from(&mut buf) => {
                         match data {
@@ -228,12 +238,24 @@ impl<'a> UDPProxy<'a> {
                                         continue;
                                     }
 
+                                    // The UDP path needs a resolved IP:port. If the
+                                    // remote isn't (yet) a usable SocketAddr, drop this
+                                    // client instead of panicking the whole proxy.
+                                    let remote_sa = match _remote.parse::<SocketAddr>() {
+                                        Ok(sa) => sa,
+                                        Err(e) => {
+                                            warn!("Cannot route {}:{} — remote {:?} is not a usable address: {}",
+                                                peer.ip(), peer.port(), _remote, e);
+                                            continue;
+                                        }
+                                    };
+
                                     info!("New client {}:{} is added", peer.ip(), peer.port());
                                     let (_s, _r) = unbounded::<(SocketAddr, Vec<u8>,  MessageType)>();
                                     self.client_tunnels.insert(peer, (_s, SystemTime::now()));
                                     let c = UDPPeerPair {
                                         client : peer,
-                                        remote: _remote.parse::<SocketAddr>().unwrap(),
+                                        remote: remote_sa,
                                         send: tx.clone(),
                                         recv: _r
                                     };
@@ -292,16 +314,23 @@ impl<'a> UDPProxy<'a> {
             Ok(())
         };
         // client_to_proxy_proc.await;
-        try_join(client_to_proxy_proc, remote_to_client_proc).await.unwrap();
+        try_join(client_to_proxy_proc, remote_to_client_proc)
+            .await
+            .unwrap();
         Ok(())
     }
 }
 
-pub async fn udp_proxy(local: &String,
-    remote: &String, settings: Arc<Settings>, cancel: CancellationToken) -> Result<(), std::io::Error>
-{
-    info!("Start service in UDP mode {}->{} (max_client_tunnels={})",
-        local, remote, settings.max_client_tunnels);
+pub async fn udp_proxy(
+    local: &String,
+    remote: &String,
+    settings: Arc<Settings>,
+    cancel: CancellationToken,
+) -> Result<(), std::io::Error> {
+    info!(
+        "Start service in UDP mode {}->{} (max_client_tunnels={})",
+        local, remote, settings.max_client_tunnels
+    );
     let mut server = UDPProxy {
         addr: &local,
         remote: &remote,

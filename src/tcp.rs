@@ -1,12 +1,12 @@
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-use tokio::net::TcpListener;
 use log::*;
-use tokio::time;
+use socket2::TcpKeepalive;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use socket2::TcpKeepalive;
+use tokio::time;
 
 use tokio_util::sync::CancellationToken;
 
@@ -50,7 +50,10 @@ impl TCPPeerPair {
 
         match tokio::io::copy_bidirectional(&mut self.client, &mut outbound).await {
             Ok((tx, rx)) => {
-                debug!("Connection to {} closed (tx={}, rx={})", self.remote, tx, rx);
+                debug!(
+                    "Connection to {} closed (tx={}, rx={})",
+                    self.remote, tx, rx
+                );
             }
             Err(e) => {
                 debug!("Connection to {} ended: {:?}", self.remote, e);
@@ -70,69 +73,73 @@ struct TCPProxy<'a> {
 }
 
 impl<'a> DNSResolve<'a> for TCPProxy<'a> {
-    fn remote(&self) -> &String{
+    fn remote(&self) -> &String {
         self.remote
     }
-    fn dns(&self) -> &Vec<String>{
+    fn dns(&self) -> &Vec<String> {
         &self.dns
     }
-    fn reset_dns(&mut self,d: &Vec<String>) -> usize {
+    fn reset_dns(&mut self, d: &Vec<String>) -> usize {
         self.dns = d.to_vec();
         self.dns.len()
     }
-
 }
 impl<'a> TCPProxy<'a> {
-
-    async fn run(& mut self) -> Result<(), std::io::Error> {
-        self.resolve().await.unwrap();
+    async fn run(&mut self) -> Result<(), std::io::Error> {
+        // Pre-flight: refuse to start unless the remote resolves to at least
+        // one address. (TCP can connect to a hostname directly, but a remote
+        // that resolves to nothing at startup is almost always a config error.)
+        self.resolve().await?;
+        if self.dns.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("remote '{}' could not be resolved", self.remote),
+            ));
+        }
         let mut time_out1 = time::interval(tokio::time::Duration::from_secs(30));
         let mut host = self.dns[0].clone();
         let max_conn = self.settings.max_connections;
         let sem = Arc::new(Semaphore::new(max_conn));
-        match TcpListener::bind(self.addr).await {
-            Ok(listener) => {
-                loop{
-                    tokio::select!{
-                        x = listener.accept() => {
-                            match x {
-                                Ok((inbound, peer_addr)) => {
-                                    let permit = match sem.clone().try_acquire_owned() {
-                                        Ok(p) => p,
-                                        Err(_) => {
-                                            warn!("Connection limit reached ({}), rejecting {}", max_conn, peer_addr);
-                                            drop(inbound);
-                                            continue;
-                                        }
-                                    };
-                                    let client = TCPPeerPair{
-                                        client: inbound,
-                                        remote: host.clone(),
-                                        settings: self.settings.clone(),
-                                    };
-                                    tokio::spawn(async move {
-                                        client.run().await;
-                                        drop(permit);
-                                    });
-                                },
-                                Err(e1) => {
-                                    error!("Failed to accept new connection from {}, err={:?}", self.addr, e1);
+        let listener = TcpListener::bind(self.addr).await.map_err(|e| {
+            std::io::Error::new(e.kind(), format!("cannot bind {}: {}", self.addr, e))
+        })?;
+        info!("Listening on {}", self.addr);
+        loop {
+            tokio::select! {
+                x = listener.accept() => {
+                    match x {
+                        Ok((inbound, peer_addr)) => {
+                            let permit = match sem.clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    warn!("Connection limit reached ({}), rejecting {}", max_conn, peer_addr);
+                                    drop(inbound);
+                                    continue;
                                 }
-                            }
+                            };
+                            let client = TCPPeerPair{
+                                client: inbound,
+                                remote: host.clone(),
+                                settings: self.settings.clone(),
+                            };
+                            tokio::spawn(async move {
+                                client.run().await;
+                                drop(permit);
+                            });
                         },
-                        _ = time_out1.tick() => {
-                            self.resolve().await.unwrap();
-                            host = self.dns[0].clone();
-                        },
-                        _ = self.cancel.cancelled() => {
-                            info!("TCP proxy {} shutting down (existing connections will drain)", self.addr);
-                            break;
+                        Err(e1) => {
+                            error!("Failed to accept new connection from {}, err={:?}", self.addr, e1);
                         }
                     }
+                },
+                _ = time_out1.tick() => {
+                    self.resolve().await.unwrap();
+                    host = self.dns[0].clone();
+                },
+                _ = self.cancel.cancelled() => {
+                    info!("TCP proxy {} shutting down (existing connections will drain)", self.addr);
+                    break;
                 }
-            },
-            Err(e) => {
-                error!("Failed to bind interface {}, err={:?}", self.addr, e);
             }
         }
 
@@ -140,9 +147,12 @@ impl<'a> TCPProxy<'a> {
     }
 }
 
-pub async fn tcp_proxy(local: &String,
-    remote: &String, settings: Arc<Settings>, cancel: CancellationToken) -> Result<(), std::io::Error>
-{
+pub async fn tcp_proxy(
+    local: &String,
+    remote: &String,
+    settings: Arc<Settings>,
+    cancel: CancellationToken,
+) -> Result<(), std::io::Error> {
     info!("Start service in TCP mode {}->{} (max_connections={}, keepalive_idle={}s, keepalive_interval={}s)",
         local, remote, settings.max_connections, settings.keepalive_idle, settings.keepalive_interval);
     let mut server = TCPProxy {
